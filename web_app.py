@@ -1,41 +1,44 @@
 """
 FateAutomata Kiosk — Remote Web Deployment Layer
 =================================================
-All data is pulled from Supabase — no local CSV or metrics files needed.
-The FAISS knowledge base folder must be present alongside this file.
+All data is pulled from Supabase — no local CSV or Pi files needed.
+The mapua_knowledge_base/ FAISS folder must be present alongside this file.
 
 Required Supabase tables:
-  attendance  (student_name, timestamp, lanyard_compliant, dresscode_compliant, synced)
+  attendance  (student_name, timestamp, synced, lanyard_compliant, dresscode_compliant)
   metrics     (timestamp, face_extract_ms, lanyard_ms, dress_ms, end_to_end_ms,
-               cpu_percent, ram_percent, temp_c, raw_dress_detected, smoothed_dress_detected,
-               face_similarity, lanyard_confidence, dress_confidence)
+               cpu_percent, ram_percent, temp_c, raw_dress_detected, smoothed_dress_detected)
 
-Run:
-  streamlit run web_app.py
-
-.env / Streamlit secrets required:
-  SUPABASE_URL, SUPABASE_KEY, COHERE_API_KEY, GROQ_API_KEY
+Run:  streamlit run web_app.py
 """
 
+# ── 1. Compatibility Shim (MUST be before any Ragas/LangChain imports) ────────
+import sys
+
+try:
+    import langchain_google_vertexai
+    sys.modules["langchain_community.chat_models.vertexai"] = langchain_google_vertexai
+except ImportError:
+    # Failsafe stub to prevent Ragas from crashing on Streamlit Cloud
+    from types import ModuleType
+    _stub = ModuleType("langchain_community.chat_models.vertexai")
+    class _ChatVertexAI:  
+        pass
+    _stub.ChatVertexAI = _ChatVertexAI
+    sys.modules["langchain_community.chat_models.vertexai"] = _stub
+
+# ── 2. Standard Imports ────────────────────────────────────────────────────────
 import os
 import math
-import nest_asyncio
 import logging
-import sys
-from datetime import datetime, date, timezone
+import nest_asyncio
+from datetime import datetime, date
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
 from supabase import create_client, Client
-
-# ── Ragas / LangChain compatibility shim ──────────────────────────────────────
-try:
-    import langchain_google_vertexai
-    sys.modules["langchain_community.chat_models.vertexai"] = langchain_google_vertexai
-except ImportError:
-    pass
 
 from langchain_cohere import ChatCohere, CohereEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -51,12 +54,11 @@ nest_asyncio.apply()
 load_dotenv()
 logging.basicConfig(stream=sys.stdout, level=logging.WARNING)
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-REFRESH_TTL  = 15    # seconds before Supabase cache expires
-PAGE_SIZE    = 25    # rows per page in log table
-METRICS_ROWS = 500   # how many recent metric rows to pull
+# ── 3. Constants & Page Config ─────────────────────────────────────────────────
+REFRESH_TTL  = 15
+PAGE_SIZE    = 25
+METRICS_ROWS = 500
 
-# ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="FateAutomata — Remote Dashboard",
     page_icon="👁️",
@@ -76,13 +78,12 @@ st.markdown("""
 .badge-red    { background: #fee2e2; color: #991b1b; }
 .badge-orange { background: #ffedd5; color: #9a3412; }
 .badge-green  { background: #dcfce7; color: #166534; }
-section[data-testid="stSidebar"] .stRadio label { font-size: 14px; padding: 4px 0; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SUPABASE CLIENT
+# SUPABASE CLIENT & DATA LOADERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource
@@ -90,17 +91,11 @@ def get_supabase() -> Client:
     url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")
     key = os.environ.get("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY", "")
     if not url or not key:
-        st.error("❌ Missing SUPABASE_URL or SUPABASE_KEY. Add them to .env or Streamlit secrets.")
+        st.error("❌ Missing SUPABASE_URL or SUPABASE_KEY in Streamlit secrets.")
         st.stop()
     return create_client(url, key)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DATA LOADERS  (all pull from Supabase)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _normalize_bools(df: pd.DataFrame) -> pd.DataFrame:
-    """Supabase returns Python bools but guard against string variants too."""
     for col in ["lanyard_compliant", "dresscode_compliant", "synced"]:
         if col in df.columns:
             df[col] = df[col].apply(
@@ -108,7 +103,6 @@ def _normalize_bools(df: pd.DataFrame) -> pd.DataFrame:
                 if not isinstance(v, bool) else v
             )
     return df
-
 
 @st.cache_data(ttl=REFRESH_TTL)
 def load_attendance() -> pd.DataFrame:
@@ -127,26 +121,23 @@ def load_attendance() -> pd.DataFrame:
         df = _normalize_bools(df)
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         df = df.sort_values("timestamp", ascending=False).reset_index(drop=True)
-        # Friendly column aliases used throughout the UI
         df = df.rename(columns={
-            "student_name":      "Student_Name",
-            "timestamp":         "Timestamp",
-            "synced":            "Cloud_Synced",
-            "lanyard_compliant": "Lanyard_Compliant",
+            "student_name":       "Student_Name",
+            "timestamp":          "Timestamp",
+            "synced":             "Cloud_Synced",
+            "lanyard_compliant":  "Lanyard_Compliant",
             "dresscode_compliant":"DressCode_Compliant",
         })
         return df
     except Exception as e:
-        st.warning(f"Could not load attendance data: {e}")
+        st.warning(f"Could not load attendance: {e}")
         return _empty_attendance()
-
 
 def _empty_attendance() -> pd.DataFrame:
     return pd.DataFrame(columns=[
         "Student_Name", "Timestamp", "Cloud_Synced",
         "Lanyard_Compliant", "DressCode_Compliant",
     ])
-
 
 @st.cache_data(ttl=REFRESH_TTL)
 def load_metrics() -> pd.DataFrame:
@@ -163,10 +154,9 @@ def load_metrics() -> pd.DataFrame:
             return pd.DataFrame()
         df = pd.DataFrame(resp.data)
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-        df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-        return df
+        return df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
     except Exception as e:
-        st.warning(f"Could not load metrics data: {e}")
+        st.warning(f"Could not load metrics: {e}")
         return pd.DataFrame()
 
 
@@ -179,23 +169,19 @@ def load_ai_components():
     cohere_key = os.environ.get("COHERE_API_KEY") or st.secrets.get("COHERE_API_KEY", "")
     groq_key   = os.environ.get("GROQ_API_KEY")   or st.secrets.get("GROQ_API_KEY", "")
 
-    embeddings = CohereEmbeddings(model="embed-english-v3.0", cohere_api_key=cohere_key)
+    embeddings   = CohereEmbeddings(model="embed-english-v3.0", cohere_api_key=cohere_key)
     vector_store = FAISS.load_local(
-        "mapua_knowledge_base",
-        embeddings,
-        allow_dangerous_deserialization=True,
+        "mapua_knowledge_base", embeddings, allow_dangerous_deserialization=True
     )
-    generator_llm = ChatCohere(model="command-a-03-2025", cohere_api_key=cohere_key)
-    judge_llm = ChatGroq(
-        model_name="llama-3.3-70b-versatile",
-        api_key=groq_key,
-        temperature=0.0,
+    generator_llm = ChatCohere(model="command-r-08-2024", cohere_api_key=cohere_key)
+    judge_llm     = ChatGroq(
+        model_name="llama-3.3-70b-versatile", api_key=groq_key, temperature=0.0
     )
-    return vector_store, generator_llm, judge_llm, embeddings
+    return vector_store, generator_llm, judge_llm
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
+# SIDEBAR NAVIGATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
@@ -209,13 +195,8 @@ with st.sidebar:
 
     page = st.radio(
         "Navigate",
-        [
-            "📊 Live Dashboard",
-            "📈 Analytics",
-            "👤 Student Profiles",
-            "🖥️ Hardware Monitor",
-            "🤖 AI Assistant",
-        ],
+        ["📊 Live Dashboard", "📈 Analytics", "👤 Student Profiles",
+         "🖥️ Hardware Monitor", "🤖 AI Assistant"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -238,11 +219,9 @@ if page == "📊 Live Dashboard":
     st.header("📊 Live Attendance & Compliance Dashboard")
 
     df = load_attendance()
-
     today_utc = pd.Timestamp(date.today(), tz="UTC")
     today_df  = df[df["Timestamp"] >= today_utc] if not df.empty else df
 
-    # ── KPI row ───────────────────────────────────────────────────────────────
     k1, k2, k3, k4, k5 = st.columns(5)
     with k1:
         st.metric("Total Logs (All Time)", len(df))
@@ -252,19 +231,17 @@ if page == "📊 Live Dashboard":
         synced = int(df["Cloud_Synced"].sum()) if not df.empty else 0
         st.metric("Synced to Supabase", synced)
     with k4:
-        missing_id = int((~df["Lanyard_Compliant"]).sum()) if not df.empty else 0
+        missing_id    = int((~df["Lanyard_Compliant"]).sum())    if not df.empty       else 0
         today_missing = int((~today_df["Lanyard_Compliant"]).sum()) if not today_df.empty else 0
         st.metric("🚨 Missing IDs (All)", missing_id,
                   delta=f"{today_missing} today", delta_color="inverse")
     with k5:
-        dress_v = int((~df["DressCode_Compliant"]).sum()) if not df.empty else 0
-        today_dress = int((~today_df["DressCode_Compliant"]).sum()) if not today_df.empty else 0
+        dress_v    = int((~df["DressCode_Compliant"]).sum())       if not df.empty       else 0
+        today_dress= int((~today_df["DressCode_Compliant"]).sum()) if not today_df.empty else 0
         st.metric("👕 Dress Violations (All)", dress_v,
                   delta=f"{today_dress} today", delta_color="inverse")
 
     st.divider()
-
-    # ── Violation feed + charts ───────────────────────────────────────────────
     col_feed, col_chart = st.columns([1.4, 1])
 
     with col_feed:
@@ -273,28 +250,23 @@ if page == "📊 Live Dashboard":
             df[~(df["Lanyard_Compliant"] & df["DressCode_Compliant"])].head(15)
             if not df.empty else df
         )
-
         if violations.empty:
             st.success("✅ No violations on record — all students compliant.")
         else:
             for _, row in violations.iterrows():
-                ts_str = (
-                    row["Timestamp"].strftime("%b %d, %H:%M:%S")
-                    if pd.notna(row["Timestamp"]) else "—"
-                )
-                flags = []
+                ts_str = row["Timestamp"].strftime("%b %d, %H:%M:%S") if pd.notna(row["Timestamp"]) else "—"
+                flags  = []
                 if not row["Lanyard_Compliant"]:
                     flags.append('<span class="badge badge-red">No Lanyard</span>')
                 if not row["DressCode_Compliant"]:
                     flags.append('<span class="badge badge-orange">Dress Code</span>')
                 flag_html   = " ".join(flags)
                 synced_icon = "☁️" if row["Cloud_Synced"] else "💾"
-
                 st.markdown(
-                    f"""<div style="background:#fff7ed; border-left:3px solid #f97316;
-                        padding:8px 12px; border-radius:6px; margin-bottom:6px;">
+                    f"""<div style="background:#fff7ed;border-left:3px solid #f97316;
+                        padding:8px 12px;border-radius:6px;margin-bottom:6px;">
                         <b>{row['Student_Name']}</b> &nbsp; {flag_html}
-                        <span style="float:right; color:#94a3b8; font-size:12px">
+                        <span style="float:right;color:#94a3b8;font-size:12px">
                             {synced_icon} {ts_str}
                         </span></div>""",
                     unsafe_allow_html=True,
@@ -307,25 +279,19 @@ if page == "📊 Live Dashboard":
             no_lan    = int((~today_df["Lanyard_Compliant"] & today_df["DressCode_Compliant"]).sum())
             dress_bad = int((today_df["Lanyard_Compliant"] & ~today_df["DressCode_Compliant"]).sum())
             both_bad  = int((~today_df["Lanyard_Compliant"] & ~today_df["DressCode_Compliant"]).sum())
-
             pie_df = pd.DataFrame({
-                "Category": ["Fully Compliant", "No Lanyard", "Dress Violation", "Both Violations"],
+                "Category": ["Fully Compliant","No Lanyard","Dress Violation","Both Violations"],
                 "Count":    [full_ok, no_lan, dress_bad, both_bad],
             })
             fig_pie = px.pie(
                 pie_df, values="Count", names="Category", hole=0.45,
                 color="Category",
                 color_discrete_map={
-                    "Fully Compliant": "#22c55e",
-                    "No Lanyard":      "#ef4444",
-                    "Dress Violation": "#f97316",
-                    "Both Violations": "#7c3aed",
+                    "Fully Compliant":"#22c55e","No Lanyard":"#ef4444",
+                    "Dress Violation":"#f97316","Both Violations":"#7c3aed",
                 },
             )
-            fig_pie.update_layout(
-                margin=dict(t=10, b=10), height=260,
-                legend=dict(font_size=12),
-            )
+            fig_pie.update_layout(margin=dict(t=10,b=10), height=260, legend=dict(font_size=12))
             st.plotly_chart(fig_pie, use_container_width=True)
         else:
             st.info("No entries for today yet.")
@@ -335,23 +301,15 @@ if page == "📊 Live Dashboard":
             h_counts = (
                 today_df.copy()
                 .assign(Hour=today_df["Timestamp"].dt.hour)
-                .groupby("Hour")
-                .size()
-                .reset_index(name="Count")
+                .groupby("Hour").size().reset_index(name="Count")
             )
-            fig_hr = px.bar(
-                h_counts, x="Hour", y="Count",
-                color_discrete_sequence=["#3b82f6"], height=200,
-            )
-            fig_hr.update_layout(
-                margin=dict(t=5, b=5, l=5, r=5),
-                xaxis_title="Hour (UTC)", yaxis_title="",
-            )
+            fig_hr = px.bar(h_counts, x="Hour", y="Count",
+                            color_discrete_sequence=["#3b82f6"], height=200)
+            fig_hr.update_layout(margin=dict(t=5,b=5,l=5,r=5),
+                                 xaxis_title="Hour (UTC)", yaxis_title="")
             st.plotly_chart(fig_hr, use_container_width=True)
 
     st.divider()
-
-    # ── Full log table ────────────────────────────────────────────────────────
     st.subheader("Full Attendance Log")
     search_q = st.text_input("🔍 Filter by student name", placeholder="e.g. CORPUZ")
     filtered = (
@@ -360,24 +318,20 @@ if page == "📊 Live Dashboard":
     )
 
     total_pages = max(1, math.ceil(len(filtered) / PAGE_SIZE))
-    pg_col1, pg_col2, _ = st.columns([1, 2, 6])
-    with pg_col1:
-        page_num = st.number_input(
-            "Page", min_value=1, max_value=total_pages,
-            value=1, step=1, label_visibility="collapsed",
-        )
-    with pg_col2:
+    pg1, pg2, _ = st.columns([1, 2, 6])
+    with pg1:
+        page_num = st.number_input("Page", min_value=1, max_value=total_pages,
+                                   value=1, step=1, label_visibility="collapsed")
+    with pg2:
         st.caption(f"Page {page_num} of {total_pages}  ({len(filtered)} rows)")
 
-    start_i  = (page_num - 1) * PAGE_SIZE
-    page_df  = filtered.iloc[start_i : start_i + PAGE_SIZE].copy()
-
+    start_i = (page_num - 1) * PAGE_SIZE
+    page_df = filtered.iloc[start_i : start_i + PAGE_SIZE].copy()
     for col in ["Cloud_Synced", "Lanyard_Compliant", "DressCode_Compliant"]:
         if col in page_df.columns:
             page_df[col] = page_df[col].apply(lambda v: "✅" if v else "❌")
     if "Timestamp" in page_df.columns:
         page_df["Timestamp"] = page_df["Timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
-
     st.dataframe(page_df, use_container_width=True, hide_index=True)
 
     if auto_refresh:
@@ -396,12 +350,11 @@ elif page == "📈 Analytics":
 
     df = load_attendance()
     if df.empty:
-        st.info("No data in Supabase yet. Make sure `recognize.py` is syncing.")
+        st.info("No data in Supabase yet.")
         st.stop()
 
     min_date = df["Timestamp"].min().date()
     max_date = df["Timestamp"].max().date()
-
     dc1, dc2 = st.columns(2)
     with dc1:
         start_d = st.date_input("From", value=min_date, min_value=min_date, max_value=max_date)
@@ -410,96 +363,61 @@ elif page == "📈 Analytics":
 
     mask = (df["Timestamp"].dt.date >= start_d) & (df["Timestamp"].dt.date <= end_d)
     fdf  = df[mask].copy()
-
     if fdf.empty:
-        st.warning("No records in selected date range.")
+        st.warning("No records in selected range.")
         st.stop()
 
     st.caption(f"Showing **{len(fdf)}** records — {start_d} → {end_d}")
     st.divider()
 
-    # Daily trend
     st.subheader("Violation Trend (Daily)")
     trend = (
-        fdf.assign(
-            Date=fdf["Timestamp"].dt.date,
-            Lanyard_V=~fdf["Lanyard_Compliant"],
-            Dress_V=~fdf["DressCode_Compliant"],
-        )
-        .groupby("Date")[["Lanyard_V", "Dress_V"]]
-        .sum()
-        .reset_index()
-        .rename(columns={"Lanyard_V": "Lanyard Violations", "Dress_V": "Dress Violations"})
+        fdf.assign(Date=fdf["Timestamp"].dt.date,
+                   Lanyard_V=~fdf["Lanyard_Compliant"],
+                   Dress_V=~fdf["DressCode_Compliant"])
+        .groupby("Date")[["Lanyard_V","Dress_V"]].sum().reset_index()
+        .rename(columns={"Lanyard_V":"Lanyard Violations","Dress_V":"Dress Violations"})
     )
-    fig_trend = px.line(
-        trend, x="Date", y=["Lanyard Violations", "Dress Violations"],
-        markers=True, color_discrete_sequence=["#ef4444", "#f97316"],
-    )
+    fig_trend = px.line(trend, x="Date", y=["Lanyard Violations","Dress Violations"],
+                        markers=True, color_discrete_sequence=["#ef4444","#f97316"])
     fig_trend.update_layout(legend_title="", yaxis_title="Count", height=300)
     st.plotly_chart(fig_trend, use_container_width=True)
 
-    # Leaderboard + heatmap
     c1, c2 = st.columns(2)
-
     with c1:
         st.subheader("Most Violations by Student")
         sv = (
             fdf.assign(Any_V=~(fdf["Lanyard_Compliant"] & fdf["DressCode_Compliant"]))
             .groupby("Student_Name")
-            .agg(Total_Logs=("Timestamp", "count"), Violations=("Any_V", "sum"))
+            .agg(Total_Logs=("Timestamp","count"), Violations=("Any_V","sum"))
             .reset_index()
         )
-        sv["Compliance Rate"] = (
-            1 - sv["Violations"] / sv["Total_Logs"].clip(lower=1)
-        ).round(2)
+        sv["Compliance Rate"] = (1 - sv["Violations"] / sv["Total_Logs"].clip(lower=1)).round(2)
         sv = sv.sort_values("Violations", ascending=False).head(10)
-
-        fig_sv = px.bar(
-            sv, x="Violations", y="Student_Name",
-            orientation="h", color="Violations",
-            color_continuous_scale="Reds", height=320,
-        )
-        fig_sv.update_layout(
-            yaxis_title="", coloraxis_showscale=False,
-            margin=dict(l=5, r=5, t=10, b=5),
-        )
+        fig_sv = px.bar(sv, x="Violations", y="Student_Name", orientation="h",
+                        color="Violations", color_continuous_scale="Reds", height=320)
+        fig_sv.update_layout(yaxis_title="", coloraxis_showscale=False,
+                              margin=dict(l=5,r=5,t=10,b=5))
         st.plotly_chart(fig_sv, use_container_width=True)
 
     with c2:
         st.subheader("Arrival Heatmap (Hour × Day)")
-        hm = fdf.assign(
-            Hour=fdf["Timestamp"].dt.hour,
-            DayOfWeek=fdf["Timestamp"].dt.day_name(),
-        )
-        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        hm_pivot  = (
-            hm.groupby(["DayOfWeek", "Hour"])
-            .size()
-            .reset_index(name="Count")
-        )
-        hm_pivot["DayOfWeek"] = pd.Categorical(
-            hm_pivot["DayOfWeek"], categories=day_order, ordered=True
-        )
-        hm_full = (
-            hm_pivot.sort_values("DayOfWeek")
-            .pivot(index="DayOfWeek", columns="Hour", values="Count")
-            .fillna(0)
-        )
-        fig_hm = px.imshow(
-            hm_full, color_continuous_scale="Blues",
-            aspect="auto", height=320,
-            labels=dict(x="Hour (UTC)", y="", color="Arrivals"),
-        )
-        fig_hm.update_layout(margin=dict(l=5, r=5, t=10, b=5))
+        day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+        hm = fdf.assign(Hour=fdf["Timestamp"].dt.hour,
+                        DayOfWeek=fdf["Timestamp"].dt.day_name())
+        hm_pivot = hm.groupby(["DayOfWeek","Hour"]).size().reset_index(name="Count")
+        hm_pivot["DayOfWeek"] = pd.Categorical(hm_pivot["DayOfWeek"], categories=day_order, ordered=True)
+        hm_full = (hm_pivot.sort_values("DayOfWeek")
+                   .pivot(index="DayOfWeek", columns="Hour", values="Count").fillna(0))
+        fig_hm = px.imshow(hm_full, color_continuous_scale="Blues", aspect="auto", height=320,
+                           labels=dict(x="Hour (UTC)", y="", color="Arrivals"))
+        fig_hm.update_layout(margin=dict(l=5,r=5,t=10,b=5))
         st.plotly_chart(fig_hm, use_container_width=True)
 
-    # Summary table
     st.subheader("Per-Student Compliance Summary")
     sv["Compliance Rate"] = sv["Compliance Rate"].apply(lambda x: f"{x*100:.1f}%")
-    st.dataframe(
-        sv.rename(columns={"Student_Name": "Student"}),
-        use_container_width=True, hide_index=True,
-    )
+    st.dataframe(sv.rename(columns={"Student_Name":"Student"}),
+                 use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -511,12 +429,11 @@ elif page == "👤 Student Profiles":
 
     df = load_attendance()
     if df.empty:
-        st.info("No attendance data in Supabase yet.")
+        st.info("No attendance data yet.")
         st.stop()
 
     students = sorted(df["Student_Name"].dropna().unique().tolist())
     selected = st.selectbox("Select a student", students)
-
     sdf = df[df["Student_Name"] == selected].copy()
 
     k1, k2, k3, k4 = st.columns(4)
@@ -525,7 +442,7 @@ elif page == "👤 Student Profiles":
     with k2:
         st.metric("Lanyard Violations", int((~sdf["Lanyard_Compliant"]).sum()))
     with k3:
-        st.metric("Dress Violations",   int((~sdf["DressCode_Compliant"]).sum()))
+        st.metric("Dress Violations", int((~sdf["DressCode_Compliant"]).sum()))
     with k4:
         rate = (sdf["Lanyard_Compliant"] & sdf["DressCode_Compliant"]).mean()
         st.metric("Compliance Rate", f"{rate*100:.1f}%")
@@ -534,46 +451,32 @@ elif page == "👤 Student Profiles":
     st.subheader(f"Scan History — {selected}")
 
     def status_label(row):
-        lan = row["Lanyard_Compliant"]
-        drs = row["DressCode_Compliant"]
-        if lan and drs:
-            return "✅ Compliant"
-        if not lan and not drs:
-            return "🔴 Both Violations"
-        if not lan:
-            return "🟠 No Lanyard"
+        lan, drs = row["Lanyard_Compliant"], row["DressCode_Compliant"]
+        if lan and drs:   return "✅ Compliant"
+        if not lan and not drs: return "🔴 Both Violations"
+        if not lan:       return "🟠 No Lanyard"
         return "🟡 Dress Code"
 
     sdf_disp = sdf.copy()
     sdf_disp["Status"]    = sdf_disp.apply(status_label, axis=1)
     sdf_disp["Timestamp"] = sdf_disp["Timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
     sdf_disp["Synced"]    = sdf_disp["Cloud_Synced"].apply(lambda v: "☁️" if v else "💾")
+    st.dataframe(sdf_disp[["Timestamp","Status","Synced"]],
+                 use_container_width=True, hide_index=True)
 
-    st.dataframe(
-        sdf_disp[["Timestamp", "Status", "Synced"]],
-        use_container_width=True, hide_index=True,
-    )
-
-    # Mini compliance bar for this student over time
     if len(sdf) >= 2:
         st.subheader("Compliance Trend")
         ts_trend = (
-            sdf.assign(
-                Date=sdf["Timestamp"].dt.date,
-                OK=(sdf["Lanyard_Compliant"] & sdf["DressCode_Compliant"]),
-            )
-            .groupby("Date")["OK"]
-            .mean()
-            .reset_index()
-            .rename(columns={"OK": "Compliance Rate"})
+            sdf.assign(Date=sdf["Timestamp"].dt.date,
+                       OK=(sdf["Lanyard_Compliant"] & sdf["DressCode_Compliant"]))
+            .groupby("Date")["OK"].mean().reset_index()
+            .rename(columns={"OK":"Compliance Rate"})
         )
-        ts_trend["Compliance Rate"] = ts_trend["Compliance Rate"] * 100
-        fig_ts = px.line(
-            ts_trend, x="Date", y="Compliance Rate",
-            markers=True, color_discrete_sequence=["#22c55e"], height=220,
-        )
-        fig_ts.update_layout(yaxis_range=[0, 105], yaxis_title="%",
-                             margin=dict(t=5, b=5))
+        ts_trend["Compliance Rate"] *= 100
+        fig_ts = px.line(ts_trend, x="Date", y="Compliance Rate",
+                         markers=True, color_discrete_sequence=["#22c55e"], height=220)
+        fig_ts.update_layout(yaxis_range=[0,105], yaxis_title="%",
+                              margin=dict(t=5,b=5))
         st.plotly_chart(fig_ts, use_container_width=True)
 
 
@@ -583,22 +486,15 @@ elif page == "👤 Student Profiles":
 
 elif page == "🖥️ Hardware Monitor":
     st.header("🖥️ Raspberry Pi 5 — Hardware Telemetry")
-    st.caption(
-        "Data is pushed from `metrics_log.csv` on the Pi to the `metrics` Supabase table "
-        "by a background sync process."
-    )
+    st.caption("Data pushed from `metrics_log.csv` on the Pi to the `metrics` Supabase table.")
 
     mdf = load_metrics()
     if mdf.empty:
-        st.info(
-            "No metrics data found in the `metrics` Supabase table. "
-            "Make sure `recognize.py` is running on the Pi and syncing its `metrics_log.csv`."
-        )
+        st.info("No metrics data in Supabase yet. Make sure `recognize.py` is syncing its metrics.")
         st.stop()
 
     latest = mdf.iloc[-1]
 
-    # ── Latest snapshot KPIs ──────────────────────────────────────────────────
     k1, k2, k3, k4, k5 = st.columns(5)
     with k1:
         cpu = latest.get("cpu_percent", None)
@@ -608,11 +504,8 @@ elif page == "🖥️ Hardware Monitor":
         st.metric("RAM %", f"{float(ram):.1f}%" if ram is not None else "—")
     with k3:
         temp = latest.get("temp_c", None)
-        st.metric(
-            "CPU Temp",
-            f"{float(temp):.1f}°C" if temp is not None else "—",
-            delta_color="inverse" if temp and float(temp) > 70 else "normal",
-        )
+        st.metric("CPU Temp", f"{float(temp):.1f}°C" if temp is not None else "—",
+                  delta_color="inverse" if temp and float(temp) > 70 else "normal")
     with k4:
         e2e = latest.get("end_to_end_ms", None)
         st.metric("End-to-End", f"{float(e2e):.1f} ms" if e2e is not None else "—")
@@ -622,9 +515,8 @@ elif page == "🖥️ Hardware Monitor":
 
     st.divider()
 
-    # ── Pipeline latency ──────────────────────────────────────────────────────
     st.subheader("Pipeline Latency Over Time (ms)")
-    lat_cols = ["face_extract_ms", "lanyard_ms", "dress_ms", "end_to_end_ms"]
+    lat_cols  = ["face_extract_ms","lanyard_ms","dress_ms","end_to_end_ms"]
     available = [c for c in lat_cols if c in mdf.columns]
     if available:
         lat_df = mdf[["timestamp"] + available].set_index("timestamp")
@@ -632,70 +524,49 @@ elif page == "🖥️ Hardware Monitor":
             lat_df[c] = pd.to_numeric(lat_df[c], errors="coerce")
         lat_df = lat_df.dropna(how="all")
         if not lat_df.empty:
-            fig_lat = px.line(
-                lat_df,
-                color_discrete_sequence=["#3b82f6", "#22c55e", "#f97316", "#7c3aed"],
-            )
-            fig_lat.update_layout(
-                legend_title="Stage", yaxis_title="ms",
-                height=300, margin=dict(t=5, b=5),
-            )
+            fig_lat = px.line(lat_df, color_discrete_sequence=["#3b82f6","#22c55e","#f97316","#7c3aed"])
+            fig_lat.update_layout(legend_title="Stage", yaxis_title="ms",
+                                  height=300, margin=dict(t=5,b=5))
             st.plotly_chart(fig_lat, use_container_width=True)
 
-    # ── CPU / RAM / Temp ──────────────────────────────────────────────────────
     hw1, hw2 = st.columns(2)
-
     with hw1:
         st.subheader("CPU & RAM Utilization")
-        hw_df = mdf[["timestamp", "cpu_percent", "ram_percent"]].copy()
-        for c in ["cpu_percent", "ram_percent"]:
+        hw_df = mdf[["timestamp","cpu_percent","ram_percent"]].copy()
+        for c in ["cpu_percent","ram_percent"]:
             hw_df[c] = pd.to_numeric(hw_df[c], errors="coerce")
         hw_df = hw_df.dropna().set_index("timestamp")
         if not hw_df.empty:
-            fig_hw = px.area(
-                hw_df, color_discrete_sequence=["#3b82f6", "#f97316"], height=250,
-            )
-            fig_hw.update_layout(
-                legend_title="", yaxis_title="%",
-                yaxis_range=[0, 100], margin=dict(t=5, b=5),
-            )
+            fig_hw = px.area(hw_df, color_discrete_sequence=["#3b82f6","#f97316"], height=250)
+            fig_hw.update_layout(legend_title="", yaxis_title="%",
+                                 yaxis_range=[0,100], margin=dict(t=5,b=5))
             st.plotly_chart(fig_hw, use_container_width=True)
 
     with hw2:
         st.subheader("CPU Temperature (°C)")
-        temp_df = mdf[["timestamp", "temp_c"]].copy()
+        temp_df = mdf[["timestamp","temp_c"]].copy()
         temp_df["temp_c"] = pd.to_numeric(temp_df["temp_c"], errors="coerce")
         temp_df = temp_df.dropna().set_index("timestamp")
         if not temp_df.empty:
             fig_t = px.line(temp_df, color_discrete_sequence=["#ef4444"], height=250)
-            fig_t.add_hline(
-                y=75, line_dash="dash", line_color="#f97316",
-                annotation_text="Throttle threshold (75°C)",
-            )
-            fig_t.update_layout(yaxis_title="°C", showlegend=False,
-                                margin=dict(t=5, b=5))
+            fig_t.add_hline(y=75, line_dash="dash", line_color="#f97316",
+                            annotation_text="Throttle threshold (75°C)")
+            fig_t.update_layout(yaxis_title="°C", showlegend=False, margin=dict(t=5,b=5))
             st.plotly_chart(fig_t, use_container_width=True)
 
-    # ── Raw vs smoothed dress detection ──────────────────────────────────────
     if "raw_dress_detected" in mdf.columns and "smoothed_dress_detected" in mdf.columns:
         st.subheader("Dress Code Detection: Raw vs Smoothed")
-        sm_df = mdf[["timestamp", "raw_dress_detected", "smoothed_dress_detected"]].tail(200).copy()
-        for c in ["raw_dress_detected", "smoothed_dress_detected"]:
+        sm_df = mdf[["timestamp","raw_dress_detected","smoothed_dress_detected"]].tail(200).copy()
+        for c in ["raw_dress_detected","smoothed_dress_detected"]:
             sm_df[c] = pd.to_numeric(sm_df[c], errors="coerce")
         sm_df = sm_df.dropna().set_index("timestamp")
         if not sm_df.empty:
-            fig_sm = px.line(
-                sm_df, color_discrete_sequence=["#f87171", "#1d4ed8"], height=220,
-            )
-            fig_sm.update_layout(
-                legend_title="", yaxis_title="Detected (1 = Yes)",
-                yaxis_range=[-0.1, 1.3], margin=dict(t=5, b=5),
-            )
+            fig_sm = px.line(sm_df, color_discrete_sequence=["#f87171","#1d4ed8"], height=220)
+            fig_sm.update_layout(legend_title="", yaxis_title="Detected (1=Yes)",
+                                 yaxis_range=[-0.1,1.3], margin=dict(t=5,b=5))
             st.plotly_chart(fig_sm, use_container_width=True)
-            st.caption(
-                "Temporal smoothing suppresses single-frame false positives "
-                "from the 1-class YOLO dataset bias."
-            )
+            st.caption("Temporal smoothing suppresses single-frame false positives "
+                       "from the 1-class YOLO dataset bias.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -711,7 +582,7 @@ elif page == "🤖 AI Assistant":
 
     with st.spinner("Loading AI components..."):
         try:
-            vector_store, generator_llm, judge_llm, _ = load_ai_components()
+            vector_store, generator_llm, judge_llm = load_ai_components()
             ai_ready = True
         except Exception as e:
             st.error(f"Could not load AI models: {e}")
@@ -787,8 +658,8 @@ USER QUESTION:
                                 return "N/A"
                             color = "#22c55e" if s >= 0.75 else ("#f97316" if s >= 0.5 else "#ef4444")
                             return (
-                                f'<span style="background:{color}; color:#fff; '
-                                f'padding:1px 8px; border-radius:999px; font-size:12px">'
+                                f'<span style="background:{color};color:#fff;'
+                                f'padding:1px 8px;border-radius:999px;font-size:12px">'
                                 f'{s:.2f}</span>'
                             )
 
@@ -807,7 +678,6 @@ USER QUESTION:
             {"role": "assistant", "content": response, "metrics": metrics_text},
         ]
 
-    # Sidebar utilities
     with st.sidebar:
         if st.button("🗑️ Clear Chat"):
             st.session_state.messages = []
@@ -823,7 +693,7 @@ USER QUESTION:
                     )
                     ctx_docs = vector_store.similarity_search(last_q, k=4)
                     for i, d in enumerate(ctx_docs, 1):
-                        st.caption(f"**Chunk {i}** — page {d.metadata.get('page', '?')}")
+                        st.caption(f"**Chunk {i}** — page {d.metadata.get('page','?')}")
                         st.markdown(d.page_content[:400] + "…")
                         st.divider()
                 except StopIteration:
