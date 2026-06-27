@@ -12,3 +12,4 @@ faiss-cpu
 datasets
 ragas
 sentence-transformers
+torchvision

@@ -2,7 +2,7 @@
 FateAutomata Kiosk — Remote Web Deployment Layer
 =================================================
 All data is pulled from Supabase — no local CSV or Pi files needed.
-The mapua_knowledge_base/ FAISS folder must be present alongside this file.
+The Knowledge Base/ FAISS folder must be present alongside this file.
 
 Required Supabase tables:
   attendance  (student_name, timestamp, synced, lanyard_compliant, dresscode_compliant)
@@ -93,6 +93,12 @@ def get_supabase() -> Client:
     if not url or not key:
         st.error("❌ Missing SUPABASE_URL or SUPABASE_KEY in Streamlit secrets.")
         st.stop()
+    # Normalize URL (remove trailing /v1 or /rest/v1)
+    if "/rest/v1" in url:
+        url = url.split("/rest/v1")[0]
+    elif "/v1" in url:
+        url = url.split("/v1")[0]
+    url = url.rstrip("/")
     return create_client(url, key)
 
 def _normalize_bools(df: pd.DataFrame) -> pd.DataFrame:
@@ -171,7 +177,7 @@ def load_ai_components():
 
     embeddings   = CohereEmbeddings(model="embed-english-v3.0", cohere_api_key=cohere_key)
     vector_store = FAISS.load_local(
-        "mapua_knowledge_base", embeddings, allow_dangerous_deserialization=True
+        "Knowledge Base", embeddings, allow_dangerous_deserialization=True
     )
     generator_llm = ChatCohere(model="command-r-08-2024", cohere_api_key=cohere_key)
     judge_llm     = ChatGroq(
@@ -186,7 +192,7 @@ def load_ai_components():
 
 with st.sidebar:
     st.image(
-        "https://upload.wikimedia.org/wikipedia/en/4/4a/Mapua_University_logo.png",
+        "mapua_logo.png",
         width=80,
     )
     st.title("FateAutomata")
